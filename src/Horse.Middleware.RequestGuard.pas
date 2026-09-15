@@ -16,29 +16,30 @@ unit Horse.Middleware.RequestGuard;
 //    THorse.Use(THorseRequestGuard.New);               // default config
 //    THorse.Use(THorseRequestGuard.New(Config));        // custom config
 //
-//  FPC note: TMethodType on FPC does not include mtOptions, so OPTIONS and any
-//  other unrecognised method map to mtAny (empty string).  They will be
-//  rejected if '' is not in AllowedMethods.  On Delphi OPTIONS maps correctly
-//  to mtOptions and is allowed when 'OPTIONS' appears in AllowedMethods.
+//  Method check uses Req.RawWebRequest.Method (the raw wire string) rather than
+//  Req.MethodType (TMethodType enum).  TMethodType collapses OPTIONS, TRACE,
+//  and CONNECT into mtAny, making them indistinguishable at enum level.
+//  The raw string correctly differentiates all three — same approach as
+//  Horse.CORS (Req.RawWebRequest.Method = 'OPTIONS').
 // ============================================================================
 
 
 (*
 Checks performed (in order, short-circuits on first failure):
 
-  1. Method in AllowedMethods?           → 405 Method Not Allowed
-  2. TRACE / CONNECT?                    → 405
+  1+2. Method in AllowedMethods?         → 405 Method Not Allowed
+       (TRACE and CONNECT are rejected because they are absent from the
+       default list; OPTIONS passes because 'OPTIONS' is in the default list)
   3. Host present and printable?         → 400 Bad Request
   4. Host in AllowedHosts? (if set)      → 400
   5. CL + TE both present?               → 400 (RFC 7230 smuggling)
-  6. Unknown Transfer-Encoding?          → 400
-  7. URL length > MaxUrlLength?          → 414 URI Too Long
-  8. Query key/value > limits?           → 400
-  9. Header count > MaxHeaderCount?      → 431 Request Header Fields Too Large
-  10. Body size > MaxBodyBytes?          → 413 Content Too Large
+  6. URL length > MaxUrlLength?          → 414 URI Too Long
+  7. Query key/value > limits?           → 400
+  8. Header count > MaxHeaderCount?      → 431 Request Header Fields Too Large
+  9. Body size > MaxBodyBytes?           → 413 Content Too Large
 
-  Note on check 10: on Indy the body is already buffered — this prevents the handler from processing an oversized body, but not from receiving it. Document this
-  clearly.
+  Note on check 9: on Indy the body is already buffered — this prevents the
+  handler from processing an oversized body, but not from receiving it.
 
 *)
 
@@ -47,8 +48,7 @@ interface
 uses
   Horse.Request,
   Horse.Response,
-  Horse.Callback,
-  Horse.Commons;
+  Horse.Callback;
 
 type
   THorseRequestGuardConfig = record
@@ -81,14 +81,35 @@ type
 
 implementation
 
+// On FPC without HORSE_FPC_FUNCTIONREFERENCES, THorseCallback is a plain
+// (Register calling convention) procedure type — it accepts neither anonymous
+// procedures (no FUNCTIONREFERENCES mode) nor method pointers (wrong calling
+// convention). The only signature it accepts is a plain unit-scope procedure.
+//
+// That is the same constraint the upstream Horse.CORS middleware works around
+// by storing its config in a unit-level var and exposing a plain procedure
+// (`CORS`). We do exactly the same here: GRequestGuardConfig holds the
+// configuration that New() last installed, and RequestGuardProc runs the
+// validation pipeline against it.
+//
+// Trade-off: configuration is process-wide. A second New(AConfig) call
+// overwrites the first. This matches Horse.CORS semantics and works on every
+// Pascal compiler (Delphi, FPC stable, FPC with or without FUNCTIONREFERENCES).
+
 uses
 {$IF DEFINED(FPC)}
   SysUtils,
-  Classes;
+  Classes,
 {$ELSE}
   System.SysUtils,
-  System.Classes;
+  System.Classes,
 {$ENDIF}
+  Horse.Proc,
+  Horse.Exception.Interrupted;
+
+var
+  GRequestGuardConfig: THorseRequestGuardConfig;
+  GRequestGuardInstalled: Boolean;
 
 { THorseRequestGuardConfig }
 
@@ -105,26 +126,6 @@ begin
 end;
 
 { Helpers — file-scope, not exported }
-
-function MethodTypeToStr(AType: TMethodType): string;
-begin
-  case AType of
-    mtGet:    Result := 'GET';
-    mtPost:   Result := 'POST';
-    mtPut:    Result := 'PUT';
-    mtHead:   Result := 'HEAD';
-    mtDelete: Result := 'DELETE';
-    mtPatch:  Result := 'PATCH';
-{$IF NOT DEFINED(FPC)}
-    mtOptions: Result := 'OPTIONS';
-{$ENDIF}
-  else
-    // mtAny = unknown/unrecognised (includes TRACE, CONNECT, and on FPC also OPTIONS).
-    // An empty string will not appear in any AllowedMethods list, so the
-    // request is rejected as 405 unless the list is empty (bypass disabled).
-    Result := '';
-  end;
-end;
 
 function StrInList(const AStr: string; const AList: TArray<string>): Boolean;
 var
@@ -152,6 +153,139 @@ begin
     end;
 end;
 
+{ Plain unit-scope procedure — assignable to THorseCallback on every
+  Pascal flavor (Delphi reference-to, FPC plain procedure, FPC FUNCTIONREFERENCES). }
+procedure RequestGuardProc(AReq: THorseRequest; ARes: THorseResponse; ANext: TNextProc);
+var
+  LMethod:  string;
+  LHost:    string;
+  LCL:      string;
+  LCLBytes: Int64;
+  LContent: TStrings;
+  I:        Integer;
+  LEntry:   string;
+  LEqPos:   Integer;
+  LKey:     string;
+  LVal:     string;
+begin
+  if not GRequestGuardInstalled then
+  begin
+    ANext;
+    Exit;
+  end;
+
+  // ── 1 + 2. Method check ─────────────────────────────────────────────
+  // Uses the raw wire string (same approach as Horse.CORS) so that OPTIONS,
+  // TRACE, and CONNECT are all distinguishable — TMethodType maps all three
+  // to mtAny and cannot tell them apart.
+  if Length(GRequestGuardConfig.AllowedMethods) > 0 then
+  begin
+    LMethod := AReq.RawWebRequest.Method;
+    if not StrInList(LMethod, GRequestGuardConfig.AllowedMethods) then
+    begin
+      ARes.Status(405).Send('Method Not Allowed');
+      raise EHorseCallbackInterrupted.Create;
+    end;
+  end;
+
+  // ── 3. Host present and printable ───────────────────────────────────
+  LHost := AReq.Host;
+  if (LHost = '') or not IsPrintable(LHost) then
+  begin
+    ARes.Status(400).Send('Bad Request: missing or invalid Host header');
+    raise EHorseCallbackInterrupted.Create;
+  end;
+
+  // ── 4. Host in AllowedHosts (if configured) ─────────────────────────
+  if (Length(GRequestGuardConfig.AllowedHosts) > 0) and
+     not StrInList(LHost, GRequestGuardConfig.AllowedHosts) then
+  begin
+    ARes.Status(400).Send('Bad Request: Host not permitted');
+    raise EHorseCallbackInterrupted.Create;
+  end;
+
+  // ── 5. CL + TE smuggling guard (RFC 7230 §3.3.3) ────────────────────
+  if GRequestGuardConfig.RejectCLWithTE and
+     AReq.Headers.ContainsKey('Content-Length') and
+     AReq.Headers.ContainsKey('Transfer-Encoding') then
+  begin
+    ARes.Status(400).Send('Bad Request: ambiguous Content-Length with Transfer-Encoding');
+    raise EHorseCallbackInterrupted.Create;
+  end;
+
+  // ── 6. URL (path) length ────────────────────────────────────────────
+  if (GRequestGuardConfig.MaxUrlLength > 0) and
+     (Length(AReq.PathInfo) > GRequestGuardConfig.MaxUrlLength) then
+  begin
+    ARes.Status(414).Send('URI Too Long');
+    raise EHorseCallbackInterrupted.Create;
+  end;
+
+  // ── 7. Query key / value length ─────────────────────────────────────
+  if (GRequestGuardConfig.MaxQueryKeyLen > 0) or
+     (GRequestGuardConfig.MaxQueryValueLen > 0) then
+  begin
+    LContent := AReq.Query.Content;
+    for I := 0 to LContent.Count - 1 do
+    begin
+      LEntry := LContent.Strings[I];
+      LEqPos := Pos('=', LEntry);
+      if LEqPos > 0 then
+      begin
+        LKey := Copy(LEntry, 1, LEqPos - 1);
+        LVal := Copy(LEntry, LEqPos + 1, MaxInt);
+      end
+      else
+      begin
+        LKey := LEntry;
+        LVal := '';
+      end;
+
+      if (GRequestGuardConfig.MaxQueryKeyLen > 0) and
+         (Length(LKey) > GRequestGuardConfig.MaxQueryKeyLen) then
+      begin
+        ARes.Status(400).Send('Bad Request: query parameter key too long');
+        raise EHorseCallbackInterrupted.Create;
+      end;
+      if (GRequestGuardConfig.MaxQueryValueLen > 0) and
+         (Length(LVal) > GRequestGuardConfig.MaxQueryValueLen) then
+      begin
+        ARes.Status(400).Send('Bad Request: query parameter value too long');
+        raise EHorseCallbackInterrupted.Create;
+      end;
+    end;
+  end;
+
+  // ── 8. Header count ─────────────────────────────────────────────────
+  if (GRequestGuardConfig.MaxHeaderCount > 0) and
+     (AReq.Headers.Count > GRequestGuardConfig.MaxHeaderCount) then
+  begin
+    ARes.Status(431).Send('Request Header Fields Too Large');
+    raise EHorseCallbackInterrupted.Create;
+  end;
+
+  // ── 9. Declared body size (Content-Length header) ───────────────────
+  // Pipeline-level guard on the declared size. On Indy the body has already
+  // been received; this prevents handlers from processing oversized payloads.
+  // On CrossSocket / mORMot the transport already enforces the limit
+  // pre-pipeline; this check is redundant but harmless.
+  if GRequestGuardConfig.MaxBodyBytes > 0 then
+  begin
+    LCL := AReq.Headers['Content-Length'];
+    if LCL <> '' then
+    begin
+      LCLBytes := StrToInt64Def(LCL, 0);
+      if LCLBytes > GRequestGuardConfig.MaxBodyBytes then
+      begin
+        ARes.Status(413).Send('Payload Too Large');
+        raise EHorseCallbackInterrupted.Create;
+      end;
+    end;
+  end;
+
+  ANext;
+end;
+
 { THorseRequestGuard }
 
 class function THorseRequestGuard.New: THorseCallback;
@@ -160,134 +294,16 @@ begin
 end;
 
 class function THorseRequestGuard.New(const AConfig: THorseRequestGuardConfig): THorseCallback;
-var
-  // Capture a copy of the config record.  AConfig is a const param (passed by
-  // reference on large records); capturing it directly would capture a
-  // pointer to a stack frame that is gone after New() returns.
-  LConfig: THorseRequestGuardConfig;
 begin
-  LConfig := AConfig;
-
-  Result :=
-    procedure(Req: THorseRequest; Res: THorseResponse; Next: TProc)
-    var
-      LMethod:  string;
-      LHost:    string;
-      LCL:      string;
-      LCLBytes: Int64;
-      LContent: TStrings;
-      I:        Integer;
-      LEntry:   string;
-      LEqPos:   Integer;
-      LKey:     string;
-      LVal:     string;
-    begin
-      // ── 1 + 2. Method check ─────────────────────────────────────────────
-      // Rejects TRACE/CONNECT (they map to mtAny → '' on both Delphi and FPC).
-      if Length(LConfig.AllowedMethods) > 0 then
-      begin
-        LMethod := MethodTypeToStr(Req.MethodType);
-        if not StrInList(LMethod, LConfig.AllowedMethods) then
-        begin
-          Res.Status(405).Send('Method Not Allowed');
-          Exit;
-        end;
-      end;
-
-      // ── 3. Host present and printable ───────────────────────────────────
-      LHost := Req.Host;
-      if (LHost = '') or not IsPrintable(LHost) then
-      begin
-        Res.Status(400).Send('Bad Request: missing or invalid Host header');
-        Exit;
-      end;
-
-      // ── 4. Host in AllowedHosts (if configured) ─────────────────────────
-      if (Length(LConfig.AllowedHosts) > 0) and
-         not StrInList(LHost, LConfig.AllowedHosts) then
-      begin
-        Res.Status(400).Send('Bad Request: Host not permitted');
-        Exit;
-      end;
-
-      // ── 5. CL + TE smuggling guard (RFC 7230 §3.3.3) ────────────────────
-      if LConfig.RejectCLWithTE and
-         Req.Headers.ContainsKey('Content-Length') and
-         Req.Headers.ContainsKey('Transfer-Encoding') then
-      begin
-        Res.Status(400).Send('Bad Request: ambiguous Content-Length with Transfer-Encoding');
-        Exit;
-      end;
-
-      // ── 6. URL (path) length ─────────────────────────────────────────────
-      if (LConfig.MaxUrlLength > 0) and
-         (Length(Req.PathInfo) > LConfig.MaxUrlLength) then
-      begin
-        Res.Status(414).Send('URI Too Long');
-        Exit;
-      end;
-
-      // ── 7. Query key / value length ──────────────────────────────────────
-      if (LConfig.MaxQueryKeyLen > 0) or (LConfig.MaxQueryValueLen > 0) then
-      begin
-        LContent := Req.Query.Content;
-        for I := 0 to LContent.Count - 1 do
-        begin
-          LEntry := LContent.Strings[I];
-          LEqPos := Pos('=', LEntry);
-          if LEqPos > 0 then
-          begin
-            LKey := Copy(LEntry, 1, LEqPos - 1);
-            LVal := Copy(LEntry, LEqPos + 1, MaxInt);
-          end
-          else
-          begin
-            LKey := LEntry;
-            LVal := '';
-          end;
-
-          if (LConfig.MaxQueryKeyLen > 0) and (Length(LKey) > LConfig.MaxQueryKeyLen) then
-          begin
-            Res.Status(400).Send('Bad Request: query parameter key too long');
-            Exit;
-          end;
-          if (LConfig.MaxQueryValueLen > 0) and (Length(LVal) > LConfig.MaxQueryValueLen) then
-          begin
-            Res.Status(400).Send('Bad Request: query parameter value too long');
-            Exit;
-          end;
-        end;
-      end;
-
-      // ── 8. Header count ──────────────────────────────────────────────────
-      if (LConfig.MaxHeaderCount > 0) and
-         (Req.Headers.Count > LConfig.MaxHeaderCount) then
-      begin
-        Res.Status(431).Send('Request Header Fields Too Large');
-        Exit;
-      end;
-
-      // ── 9. Declared body size (Content-Length header) ────────────────────
-      // This is a pipeline-level guard on the declared size.  On Indy the body
-      // has already been received; this prevents handlers from processing
-      // oversized payloads.  On CrossSocket the transport already enforces the
-      // limit pre-pipeline; this check is redundant but harmless.
-      if LConfig.MaxBodyBytes > 0 then
-      begin
-        LCL := Req.Headers['Content-Length'];
-        if LCL <> '' then
-        begin
-          LCLBytes := StrToInt64Def(LCL, 0);
-          if LCLBytes > LConfig.MaxBodyBytes then
-          begin
-            Res.Status(413).Send('Payload Too Large');
-            Exit;
-          end;
-        end;
-      end;
-
-      Next;
-    end;
+  GRequestGuardConfig    := AConfig;
+  GRequestGuardInstalled := True;
+  // No `@` here — Delphi promotes a plain procedure to its reference-to type
+  // automatically; FPC's {$MODE DELPHI} accepts the same form. Adding `@` would
+  // force a raw Pointer and trigger a type-mismatch on Delphi's THorseCallback.
+  Result                 := RequestGuardProc;
 end;
+
+initialization
+  GRequestGuardInstalled := False;
 
 end.
