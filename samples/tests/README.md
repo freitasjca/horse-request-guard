@@ -104,7 +104,7 @@ The server registers `THorseRequestGuard` with a deliberately restrictive custom
 | 01 | GET | `/ping` | 200 "pong" | Valid GET — all checks pass |
 | 02 | POST | `/echo` body="hello" | 200 "hello" | Valid POST with body |
 | 03 | DELETE | `/ping` | 405 | Method not in AllowedMethods |
-| 04 | TRACE | `/ping` | 405 | TRACE always blocked (maps to mtAny → "" not in any list) |
+| 04 | TRACE | `/ping` | 405 | TRACE not in AllowedMethods |
 | 05 | GET | `/path/exceeds/twenty` (21 chars) | 414 | URL length > MaxUrlLength |
 | 06 | GET | `/ping?a_long_key2=v` (key=11 chars) | 400 | Query key > MaxQueryKeyLen |
 | 07 | GET | `/ping?k=a_very_long_value` (value=17 chars) | 400 | Query value > MaxQueryValueLen |
@@ -117,7 +117,7 @@ The server registers `THorseRequestGuard` with a deliberately restrictive custom
 
 ### Notes on specific tests
 
-**Test 04 (TRACE):** `TCrossHttpClient` sends the method string verbatim. Horse maps unknown methods to `mtAny`, which `MethodTypeToStr` converts to `""`. An empty string is never in any `AllowedMethods` list, so TRACE is rejected with 405.
+**Test 04 (TRACE):** `TCrossHttpClient` sends the method string verbatim, and the guard compares that string (`Req.RawWebRequest.Method`) with `AllowedMethods`. TRACE is not in the server's list (GET, POST), so it is rejected with 405. It is not blocked unconditionally: a list that includes TRACE, or an empty list, lets it through.
 
 **Test 10 (CL + TE):** On the CrossSocket path, `TRequestBridge.Populate` also enforces this rule pre-pipeline. The test verifies the end-to-end rejection (400) regardless of which layer enforces it. On the Indy path, the middleware is the only enforcer.
 

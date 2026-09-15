@@ -16,8 +16,7 @@ Registers a single middleware that validates each incoming request **before it r
 
 | # | Check | Failure status |
 |---|---|:---:|
-| 1 | HTTP method in `AllowedMethods` | `405` |
-| 2 | TRACE / CONNECT blocked unconditionally | `405` |
+| 1–2 | HTTP method in `AllowedMethods` (TRACE and CONNECT are rejected because the default list leaves them out) | `405` |
 | 3 | `Host` header present and printable (no control characters) | `400` |
 | 4 | `Host` matches `AllowedHosts` (if configured) | `400` |
 | 5 | `Content-Length` and `Transfer-Encoding` not both present (RFC 7230 §3.3.3) | `400` |
@@ -29,6 +28,8 @@ Registers a single middleware that validates each incoming request **before it r
 ---
 
 ## Installation
+
+Requires Horse 3.1.0 or later.
 
 ```bash
 boss install github.com/freitasjca/horse-request-guard
@@ -89,6 +90,8 @@ begin
 end.
 ```
 
+The configuration is process-wide: a second `THorseRequestGuard.New` call replaces the first, so register the guard once.
+
 ---
 
 ## Configuration reference
@@ -110,7 +113,7 @@ type
 
 | Field | Default | Description |
 |---|---|---|
-| `AllowedMethods` | `GET POST PUT DELETE PATCH HEAD OPTIONS` | Accepted HTTP verbs.  TRACE and CONNECT are always rejected regardless of this list. |
+| `AllowedMethods` | `GET POST PUT DELETE PATCH HEAD OPTIONS` | Accepted HTTP verbs, compared case-insensitively with the method as sent. TRACE and CONNECT are rejected because the default list leaves them out; adding them to the list allows them. An empty list disables the method check. |
 | `AllowedHosts` | *(empty — any)* | If non-empty, the `Host` header must match one of these values (case-insensitive). |
 | `MaxUrlLength` | `8192` | Maximum length of the decoded request path in characters. |
 | `MaxQueryKeyLen` | `2048` | Maximum length of a single query-string key. |
@@ -136,7 +139,7 @@ type
 
 ### FPC note
 
-On Free Pascal, `TMethodType` does not include `mtOptions`.  `OPTIONS` requests arrive as `mtAny` (unrecognised method) and will be rejected with `405` if `OPTIONS` is not also listed in `AllowedMethods` *and* the runtime can distinguish it from other unknown methods — which it cannot on FPC.  If you require `OPTIONS` support under FPC + Indy, remove `OPTIONS` from the check by either clearing `AllowedMethods` (disables the method check entirely) or accepting the limitation.
+The method check reads the method string as sent (`Req.RawWebRequest.Method`), not `TMethodType`, so `OPTIONS`, `TRACE` and `CONNECT` are told apart on both Delphi and Free Pascal. On FPC without `HORSE_FPC_FUNCTIONREFERENCES`, Horse callbacks must be plain procedures; the guard is one, so no extra define is needed. The FPC build has not been verified yet.
 
 ---
 

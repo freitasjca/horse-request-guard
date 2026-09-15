@@ -1,4 +1,4 @@
-﻿program HorseRGTestClient;
+program HorseRGTestClient;
 
 {$APPTYPE CONSOLE}
 
@@ -16,7 +16,7 @@
     01  GET  /ping                         → 200 "pong"        (happy path)
     02  POST /echo  body="hello"           → 200 "hello"       (valid POST)
     03  DELETE /ping                       → 405               (method not in AllowedMethods)
-    04  TRACE /ping                        → 405               (TRACE always blocked)
+    04  TRACE /ping                        → 405               (TRACE not in AllowedMethods)
     05  GET  /path/exceeds/twenty/chars    → 414               (URL length 26 > MaxUrlLength 20)
     06  GET  /ping?a_long_key2=v           → 400               (query key > MaxQueryKeyLen)
     07  GET  /ping?k=a_very_long_value     → 400               (query value > MaxQueryValueLen)
@@ -156,8 +156,9 @@ begin
   DoSync(AClient, 'DELETE', BASE_URL + '/ping', nil, nil, R);
   Check('status 405', R.StatusCode = 405, IntToStr(R.StatusCode));
 
-  // ── 04  TRACE always blocked (maps to mtAny → "" not in any AllowedMethods) ─
-  Section('04  TRACE /ping  (always blocked regardless of AllowedMethods)');
+  // ── 04  TRACE rejected: the guard compares the method string as sent, and ────
+  //        TRACE is not in the server's AllowedMethods (GET, POST)
+  Section('04  TRACE /ping  (TRACE not in AllowedMethods)');
   DoSync(AClient, 'TRACE', BASE_URL + '/ping', nil, nil, R);
   Check('status 405', R.StatusCode = 405, IntToStr(R.StatusCode));
 

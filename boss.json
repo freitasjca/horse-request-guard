@@ -1,11 +1,11 @@
 {
   "name": "horse-request-guard",
-  "version": "1.0.0-beta.1",
+  "version": "1.0.0",
   "description": "Input validation middleware for the Horse web framework",
   "mainsrc": "src/",
   "browsingpath": "src/",
   "homepage": "https://github.com/freitasjca/horse-request-guard",
   "dependencies": {
-    "github.com/HashLoad/horse": ">=3.0.0"
+    "github.com/HashLoad/horse": ">=3.1.0"
   }
 }
