@@ -100,9 +100,11 @@ uses
 {$IF DEFINED(FPC)}
   SysUtils,
   Classes,
+  Generics.Collections,
 {$ELSE}
   System.SysUtils,
   System.Classes,
+  System.Generics.Collections,
 {$ENDIF}
   Horse.Proc,
   Horse.Exception.Interrupted;
@@ -161,12 +163,7 @@ var
   LHost:    string;
   LCL:      string;
   LCLBytes: Int64;
-  LContent: TStrings;
-  I:        Integer;
-  LEntry:   string;
-  LEqPos:   Integer;
-  LKey:     string;
-  LVal:     string;
+  LPair:    TPair<string, string>;
 begin
   if not GRequestGuardInstalled then
   begin
@@ -222,33 +219,28 @@ begin
   end;
 
   // ── 7. Query key / value length ─────────────────────────────────────
+  // [FIX-RG-DECODE-ONCE-1] Iterate Query.Dictionary, never Query.Content (or
+  // ToArray / TryGetValue / Items[]).  The stored values are already
+  // URL-decoded, and on Horse 3.3.0–3.3.5 those accessors decode a second
+  // time: a value holding a literal '%' ("100%" from ?k=100%25) raised
+  // EConvertError here and turned a valid request into a 500 before any
+  // route ran.  Dictionary (present since Horse 3.0.0) returns the stored
+  // pairs as-is on every Horse version, with or without HashLoad/horse#570.
+  // It also splits key from value itself, so a key containing '=' is no
+  // longer mis-measured.
   if (GRequestGuardConfig.MaxQueryKeyLen > 0) or
      (GRequestGuardConfig.MaxQueryValueLen > 0) then
   begin
-    LContent := AReq.Query.Content;
-    for I := 0 to LContent.Count - 1 do
+    for LPair in AReq.Query.Dictionary do
     begin
-      LEntry := LContent.Strings[I];
-      LEqPos := Pos('=', LEntry);
-      if LEqPos > 0 then
-      begin
-        LKey := Copy(LEntry, 1, LEqPos - 1);
-        LVal := Copy(LEntry, LEqPos + 1, MaxInt);
-      end
-      else
-      begin
-        LKey := LEntry;
-        LVal := '';
-      end;
-
       if (GRequestGuardConfig.MaxQueryKeyLen > 0) and
-         (Length(LKey) > GRequestGuardConfig.MaxQueryKeyLen) then
+         (Length(LPair.Key) > GRequestGuardConfig.MaxQueryKeyLen) then
       begin
         ARes.Status(400).Send('Bad Request: query parameter key too long');
         raise EHorseCallbackInterrupted.Create;
       end;
       if (GRequestGuardConfig.MaxQueryValueLen > 0) and
-         (Length(LVal) > GRequestGuardConfig.MaxQueryValueLen) then
+         (Length(LPair.Value) > GRequestGuardConfig.MaxQueryValueLen) then
       begin
         ARes.Status(400).Send('Bad Request: query parameter value too long');
         raise EHorseCallbackInterrupted.Create;
